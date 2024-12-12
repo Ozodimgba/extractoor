@@ -1,6 +1,7 @@
 process.removeAllListeners('warning');
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { CashmereSDK } from "./cashmere";
+import { MeanFinanceSDK } from "./meanFinance";
 import { AnchorProvider } from "@coral-xyz/anchor";
 import NodeWallet from "@coral-xyz/anchor/dist/cjs/nodewallet";
 import bs58 from 'bs58';
