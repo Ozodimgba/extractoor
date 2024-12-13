@@ -1,6 +1,10 @@
-import { BN, Program, Provider } from "@project-serum/anchor";
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram } from "@solana/web3.js";
+import { AnchorProvider, BN, Program, Provider } from "@project-serum/anchor";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { MeanMultisig, IDL } from "./IDL/mf";
+import { aborted } from "util";
+import NodeWallet from "@project-serum/anchor/dist/cjs/nodewallet";
+import { MEAN_MULTISIG_OPS } from "@mean-dao/mean-multisig-sdk";
+
 
 export const MEAN_MULTISIG_PROGRAM = new PublicKey('FF7U7Vj1PpBkTPau7frwLLrUHrjkxTQLsH7U5K3T3B3j');
 
@@ -17,11 +21,14 @@ export type TransferSolParams = {
 export class MeanFinanceSDK {
     public program: Program<MeanMultisig>;
     public connection: Connection;
+    public provider: AnchorProvider;
+    private wallet: NodeWallet;
     
 
-    constructor(provider?: Provider) {
+    constructor(provider?: AnchorProvider, wallet?: NodeWallet) {
         this.program = new Program<MeanMultisig>(IDL as MeanMultisig, MEAN_MULTISIG_PROGRAM, provider);
         this.connection = this.program.provider.connection;
+        this.wallet = wallet;
     }
 
     async getMultisigSignerPDA(multisig: PublicKey): Promise<[PublicKey, number]> {
@@ -50,6 +57,111 @@ export class MeanFinanceSDK {
             [Buffer.from("ops")],
             this.program.programId
         );
+    }
+
+    async createMultisig(
+        owners: Array<{ address: PublicKey; name: string }>,
+        threshold: number,
+        label: string
+    ): Promise<{ txSignature: string; multisigPubkey: PublicKey }> {
+        // Input validation
+        if (!owners || owners.length === 0) {
+            throw new Error('Owners length must be non zero');
+        }
+
+        if (threshold <= 0 || threshold > owners.length) {
+            throw new Error('Threshold must be between 1 and the number of owners');
+        }
+
+        if (label.length > 32) {
+            throw new Error('Label must be less than 32 bytes');
+        }
+
+        // Check for duplicate owners
+        const uniqueOwners = new Set(owners.map(owner => owner.address.toString()));
+        if (uniqueOwners.size !== owners.length) {
+            throw new Error('Owners must be unique');
+        }
+
+        // Validate owner names
+        for (const owner of owners) {
+            if (owner.name.length >= 32) {
+                throw new Error('Owner name must have less than 32 bytes');
+            }
+        }
+
+        // Generate a new keypair for the multisig account
+        const multisigKeypair = Keypair.generate()
+
+        const [multisigSigner, nonce] = await PublicKey.findProgramAddress(
+            [multisigKeypair.publicKey.toBuffer()],
+            this.program.programId
+          );
+
+        console.log(multisigSigner)
+        
+        // Get the settings account PDA
+        const [settingsAddress] = await PublicKey.findProgramAddress(
+            [Buffer.from('settings')],
+            this.program.programId
+        );
+
+        // Get the ops account from settings
+        const settings = await this.program.account.settings.fetch(settingsAddress);
+        
+        // Format owners for the instruction
+        const formattedOwners = owners.map(owner => ({
+            address: owner.address,
+            name: owner.name
+        }));
+
+    
+            // Create the multisig account
+            const transaction = await this.program.methods
+                .createMultisig(
+                    formattedOwners,
+                    new BN(threshold),
+                    nonce,
+                    label
+                )
+                .accounts({
+                    proposer: this.wallet.publicKey,
+                    multisig: multisigKeypair.publicKey,
+                    opsAccount: MEAN_MULTISIG_OPS,
+                    settings: settingsAddress,
+                    systemProgram: SystemProgram.programId,
+                })
+                .transaction();
+
+                console.log('Required signers:', transaction.signatures.map(s => s.publicKey.toString()));
+
+                const recentBlockhash = await this.connection.getLatestBlockhash();
+
+                transaction.recentBlockhash = recentBlockhash.blockhash;
+                transaction.feePayer = this.wallet.publicKey;
+
+                transaction.partialSign(...[multisigKeypair])
+                await this.wallet.signTransaction(transaction);
+
+                console.log('Signatures after signing:', transaction.signatures.map(s => ({
+                    publicKey: s.publicKey.toString(),
+                    signature: s.signature ? 'present' : 'missing'
+                })));
+
+                if (!transaction.signatures.some(sig => sig.publicKey.equals(this.wallet.publicKey))) {
+                    await this.wallet.signTransaction(transaction);
+                }
+
+                const signature = await this.connection.sendTransaction(transaction, [this.wallet.payer, multisigKeypair]);
+
+                console.log(signature)
+                
+
+            return {
+                txSignature: signature,
+                multisigPubkey: multisigKeypair.publicKey,
+            };
+        
     }
 
     async createTransferSolTransaction(params: TransferSolParams): Promise<string> {
